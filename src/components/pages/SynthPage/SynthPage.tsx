@@ -24,9 +24,9 @@ import {SynthPageSkeleton} from './SynthPageSkeleton';
 import {KnobsLayout} from './KnobsLayout';
 import {title} from './constants';
 import {SynthPageLayout} from './SynthPageLayout';
-import {useStateWithEffect} from '@/components/hooks/useStateWithEffect';
 import {MidiSelector} from '@/components/pages/SynthPage/MidiSelector';
 import {noteToFreq} from '@/utils/math/midi';
+import {useReducerWithEffect} from '@/components/hooks/useReducerWithEffect';
 
 const {colors} = resolveConfig(tailwindConfig).theme;
 
@@ -96,17 +96,68 @@ type SynthPageMainProps = {
   core: WebAudioRenderer;
 };
 
+const numVoices = 8;
+const middleC = 60;
 const initialState = {
-  gate: 0,
-  freq: 440,
+  voices: Array.from({length: numVoices}, () => ({
+    note: 60,
+    gate: 0,
+  })),
+  idleVoices: Array.from({length: numVoices}, (_, index) => index),
+  activeVoices: [] as number[],
   attack: 0.001,
   decay: 0.6,
   sustain: 0.7,
   release: 0.6,
+  gain: 0.5,
 };
+
+type State = typeof initialState;
+
+type Action =
+  | {
+      type: 'controlChange';
+      name: 'attack' | 'decay' | 'sustain' | 'release' | 'gain';
+      value: number;
+    }
+  | {type: 'noteOn'; note: number}
+  | {type: 'noteOff'; note: number};
 
 const meterLeftSource = 'meter:left';
 const meterRightSource = 'meter:right';
+
+function reducer(state: State, action: Action) {
+  switch (action.type) {
+    case 'controlChange':
+      state[action.name] = action.value;
+      break;
+    case 'noteOn':
+      if (state.idleVoices.length > 0) {
+        const index = state.idleVoices.shift()!;
+        state.voices[index] = {note: action.note, gate: 1};
+        state.activeVoices.push(index);
+      }
+
+      break;
+    case 'noteOff':
+      if (state.activeVoices.length > 0) {
+        const index = state.activeVoices.find(
+          (index) => state.voices[index].note === action.note,
+        );
+        if (index !== undefined) {
+          state.voices[index].gate = 0;
+          state.activeVoices.splice(state.activeVoices.indexOf(index), 1);
+          state.idleVoices.push(index);
+        }
+      }
+
+      break;
+    default:
+      console.warn('Unhandled action', action);
+  }
+
+  return state;
+}
 
 function SynthPageMain({core}: SynthPageMainProps) {
   const meterLeftRef = useRef<HTMLCanvasElement>(null);
@@ -115,26 +166,41 @@ function SynthPageMain({core}: SynthPageMainProps) {
   useMeter({core, meterRef: meterLeftRef, source: meterLeftSource});
   useMeter({core, meterRef: meterRightRef, source: meterRightSource});
 
-  const [state, setStateAndRender] = useStateWithEffect(
+  const [state, dispatch] = useReducerWithEffect(
     initialState,
+    reducer,
     useCallback(
       (state) => {
-        const gateNode = el.const({key: 'gate', value: state.gate});
-        const freqNode = el.const({key: 'freq', value: state.freq});
-        const attackNode = el.const({key: 'attack', value: state.attack});
-        const decayNode = el.const({key: 'decay', value: state.decay});
-        const sustainNode = el.const({key: 'sustain', value: state.sustain});
-        const releaseNode = el.const({key: 'release', value: state.release});
-
-        const envelope = el.adsr(
-          attackNode,
-          decayNode,
-          sustainNode,
-          releaseNode,
-          gateNode,
-        );
-        const sine = el.cycle(freqNode);
-        const out = el.mul(envelope, sine);
+        const renderedVoices = state.voices.map((voice, index) => {
+          const attackNode = el.const({
+            key: `attack:${index}`,
+            value: state.attack,
+          });
+          const decayNode = el.const({
+            key: `decay:${index}`,
+            value: state.decay,
+          });
+          const sustainNode = el.const({
+            key: `sustain:${index}`,
+            value: state.sustain,
+          });
+          const releaseNode = el.const({
+            key: `release:${index}`,
+            value: state.release,
+          });
+          const sine = el.cycle(noteToFreq(voice.note));
+          const gateNode = el.const({key: `gate:${index}`, value: voice.gate});
+          const envelope = el.adsr(
+            attackNode,
+            decayNode,
+            sustainNode,
+            releaseNode,
+            gateNode,
+          );
+          return el.mul(envelope, sine);
+        });
+        const gain = el.const({key: 'gain', value: state.gain});
+        const out = el.mul(el.add(...renderedVoices), gain);
         core.render(
           el.meter({name: meterLeftSource}, out),
           el.meter({name: meterRightSource}, out),
@@ -145,20 +211,17 @@ function SynthPageMain({core}: SynthPageMainProps) {
   );
 
   const playNote = useCallback(
-    (midiNote?: number) => {
-      const stateUpdate = midiNote
-        ? {gate: 1, freq: noteToFreq(midiNote)}
-        : {gate: 1};
-      setStateAndRender(stateUpdate);
+    (midiNote: number) => {
+      dispatch({type: 'noteOn', note: midiNote});
     },
-    [setStateAndRender],
+    [dispatch],
   );
 
   const stopNote = useCallback(
-    (midiNote?: number) => {
-      setStateAndRender({gate: 0});
+    (midiNote: number) => {
+      dispatch({type: 'noteOff', note: midiNote});
     },
-    [setStateAndRender],
+    [dispatch],
   );
 
   useEffect(() => {
@@ -169,13 +232,13 @@ function SynthPageMain({core}: SynthPageMainProps) {
       }
 
       if (event.code === keyCodes.space) {
-        playNote();
+        playNote(middleC);
       }
     };
 
     const onKeyUp = (event: KeyboardEvent) => {
       if (event.code === keyCodes.space) {
-        stopNote();
+        stopNote(middleC);
       }
     };
 
@@ -200,11 +263,11 @@ function SynthPageMain({core}: SynthPageMainProps) {
         <KnobsLayout>
           <KnobInput
             isLarge
-            title='Frequency'
-            kind='frequency'
-            value={state.freq}
+            title='Gain'
+            kind='percentage'
+            value={state.gain}
             onChange={(value) => {
-              setStateAndRender({freq: value});
+              dispatch({type: 'controlChange', name: 'gain', value});
             }}
           />
           <KnobInput
@@ -212,7 +275,7 @@ function SynthPageMain({core}: SynthPageMainProps) {
             kind='adr'
             value={state.attack}
             onChange={(value) => {
-              setStateAndRender({attack: value});
+              dispatch({type: 'controlChange', name: 'attack', value});
             }}
           />
           <KnobInput
@@ -220,7 +283,7 @@ function SynthPageMain({core}: SynthPageMainProps) {
             kind='adr'
             value={state.decay}
             onChange={(value) => {
-              setStateAndRender({decay: value});
+              dispatch({type: 'controlChange', name: 'decay', value});
             }}
           />
           <KnobInput
@@ -228,7 +291,7 @@ function SynthPageMain({core}: SynthPageMainProps) {
             kind='percentage'
             value={state.sustain}
             onChange={(value) => {
-              setStateAndRender({sustain: value});
+              dispatch({type: 'controlChange', name: 'sustain', value});
             }}
           />
           <KnobInput
@@ -236,7 +299,7 @@ function SynthPageMain({core}: SynthPageMainProps) {
             kind='adr'
             value={state.release}
             onChange={(value) => {
-              setStateAndRender({release: value});
+              dispatch({type: 'controlChange', name: 'release', value});
             }}
           />
         </KnobsLayout>
@@ -246,16 +309,16 @@ function SynthPageMain({core}: SynthPageMainProps) {
         icon={<PlayIcon />}
         title="Touch here to play or press the 'Space' key."
         onTouchStart={() => {
-          playNote();
+          playNote(middleC);
         }}
         onTouchEnd={() => {
-          stopNote();
+          stopNote(middleC);
         }}
         onMouseDown={() => {
-          playNote();
+          playNote(middleC);
         }}
         onMouseUp={() => {
-          stopNote();
+          stopNote(middleC);
         }}
       />
     </SynthPageLayout>
